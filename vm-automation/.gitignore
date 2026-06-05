@@ -1,3 +1,6 @@
 __pycache__
-*.vmx
-*.log
+**.vmx
+**.log
+**.iso
+isos/
+logs/
