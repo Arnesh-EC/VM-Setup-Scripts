@@ -22,6 +22,10 @@
       6. Writes a minimal unattend.xml to C:\Windows\System32\Sysprep\unattend.xml.
       7. Runs Sysprep /generalize /oobe /shutdown /unattend and verifies the
          generalize actually succeeded before declaring victory.
+      8. On ANY failure between the start of the script and Sysprep completing
+         generalize, automatically rolls back everything staged so far
+         (staged files, Scripts directory, ExecutionPolicy). A staged-but-
+         aborted run can also be undone later with -Rollback.
 
     After the VM powers off:
       - Export / snapshot the VMDK as your golden image.
@@ -44,6 +48,14 @@
 .PARAMETER Force
     Overwrite existing files in C:\Windows\Setup\Scripts\ without prompting.
 
+.PARAMETER Rollback
+    Undo everything this script stages and exit: removes SetupComplete.cmd,
+    FirstBoot.ps1 and unattend.xml, removes C:\Windows\Setup\Scripts if this
+    script created it, and restores the previous LocalMachine ExecutionPolicy.
+    Reads the state file written during staging
+    (C:\Windows\Temp\firstboot-sysprep-rollback.json); if no state file
+    exists, falls back to removing the known staged paths.
+
 .EXAMPLE
     # Interactive password prompt, then full sysprep:
     .\Prepare-GoldenImage.ps1
@@ -55,6 +67,10 @@
 .EXAMPLE
     # Dry-run -- write files only, skip sysprep:
     .\Prepare-GoldenImage.ps1 -SkipSysprep
+
+.EXAMPLE
+    # Undo a previous staging (after -SkipSysprep, an abort, or a failure):
+    .\Prepare-GoldenImage.ps1 -Rollback
 
 .NOTES
     - Must be run as Administrator.
@@ -71,7 +87,10 @@ param(
     [switch] $SkipSysprep,
 
     [Parameter(Mandatory = $false)]
-    [switch] $Force
+    [switch] $Force,
+
+    [Parameter(Mandatory = $false)]
+    [switch] $Rollback
 )
 
 Set-StrictMode -Version Latest
@@ -109,32 +128,172 @@ function ConvertFrom-SecureToPlain {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Environment validation
+# Rollback support
+# ---------------------------------------------------------------------------
+# Every change the script makes is recorded in $script:RollbackState and
+# persisted to a state file, so it can be undone -- automatically on failure
+# (see the trap below) or explicitly via -Rollback in a later invocation.
+
+$script:StateFile  = "$env:SystemRoot\Temp\firstboot-sysprep-rollback.json"
+$script:InRollback = $false
+
+$script:RollbackState = [ordered]@{
+    timestamp               = (Get-Date -Format o)
+    scriptsDirCreated       = $false
+    executionPolicyChanged  = $false
+    originalExecutionPolicy = $null
+    stagedFiles             = @()
+}
+
+function Save-RollbackState {
+    $script:RollbackState | ConvertTo-Json | Set-Content -Path $script:StateFile -Encoding UTF8
+}
+
+function Add-StagedFile {
+    param([string]$Path)
+    if ($script:RollbackState.stagedFiles -notcontains $Path) {
+        $script:RollbackState.stagedFiles += $Path
+    }
+    Save-RollbackState
+}
+
+function Invoke-Rollback {
+    <#
+        Undoes everything the script staged. Best effort: each step warns on
+        failure instead of aborting, so one stuck item does not block the rest.
+
+        -State: in-memory state from the current run (automatic rollback on
+        failure). When omitted (-Rollback invocation), state is loaded from
+        the state file; if that is missing too, falls back to removing the
+        well-known staged paths.
+    #>
+    param([object]$State)
+
+    $script:InRollback = $true
+
+    Write-Step "Rolling back staged changes"
+
+    if (-not $State) {
+        if (Test-Path $script:StateFile) {
+            $State = Get-Content -Path $script:StateFile -Raw | ConvertFrom-Json
+            Write-OK "Loaded rollback state: $script:StateFile"
+        } else {
+            Write-Warn "No rollback state file found at $script:StateFile."
+            Write-Warn "Removing the well-known staged artifacts instead (best effort)."
+            $State = [pscustomobject]@{
+                scriptsDirCreated       = $false
+                executionPolicyChanged  = $false
+                originalExecutionPolicy = $null
+                stagedFiles             = @(
+                    "$env:SystemRoot\Setup\Scripts\SetupComplete.cmd"
+                    "$env:SystemRoot\Setup\Scripts\FirstBoot.ps1"
+                    "$env:SystemRoot\System32\Sysprep\unattend.xml"
+                )
+            }
+        }
+    }
+
+    $didSomething = $false
+
+    # 1. Remove staged files
+    foreach ($f in @($State.stagedFiles)) {
+        if ($f -and (Test-Path $f)) {
+            try {
+                Remove-Item -Path $f -Force
+                Write-OK "Removed: $f"
+                $didSomething = $true
+            } catch {
+                Write-Warn "Could not remove $f : $($_.Exception.Message)"
+            }
+        }
+    }
+
+    # 2. Remove the Scripts directory -- only if we created it and it is empty
+    $rbScriptsDir = "$env:SystemRoot\Setup\Scripts"
+    if ($State.scriptsDirCreated -and (Test-Path $rbScriptsDir) -and
+        -not (Get-ChildItem -Path $rbScriptsDir -Force)) {
+        try {
+            Remove-Item -Path $rbScriptsDir -Force
+            Write-OK "Removed directory: $rbScriptsDir"
+            $didSomething = $true
+        } catch {
+            Write-Warn "Could not remove $rbScriptsDir : $($_.Exception.Message)"
+        }
+    }
+
+    # 3. Restore the previous LocalMachine ExecutionPolicy
+    if ($State.executionPolicyChanged -and $State.originalExecutionPolicy) {
+        try {
+            Set-ExecutionPolicy -ExecutionPolicy $State.originalExecutionPolicy -Scope LocalMachine -Force
+            Write-OK "ExecutionPolicy (LocalMachine) restored to $($State.originalExecutionPolicy)"
+            $didSomething = $true
+        } catch {
+            Write-Warn "Could not restore ExecutionPolicy: $($_.Exception.Message)"
+        }
+    }
+
+    # 4. Drop the state file -- the recorded changes no longer exist
+    if (Test-Path $script:StateFile) {
+        Remove-Item -Path $script:StateFile -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($didSomething) { Write-OK "Rollback complete." }
+    else               { Write-OK "Nothing to roll back." }
+
+    $script:InRollback = $false
+}
+
+# ---------------------------------------------------------------------------
+# 0. Elevation check, standalone rollback, failure trap
 # ---------------------------------------------------------------------------
 
-Write-Step "Validating environment"
-
-# Must be elevated
+# Must be elevated -- both a normal run and a rollback touch C:\Windows.
 $currentPrincipal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Fail "This script must be run as Administrator."
     exit 1
 }
+
+# Standalone rollback: undo a previous staging and exit.
+if ($Rollback) {
+    Invoke-Rollback
+    exit 0
+}
+
+# Automatic rollback: with $ErrorActionPreference = 'Stop', any failure from
+# here until Sysprep completes generalize raises a terminating error, which
+# lands in this trap and rolls back everything staged so far. Intentional
+# stops (user abort, -SkipSysprep) use 'exit', which bypasses the trap.
+trap {
+    if ($script:InRollback) {
+        Write-Fail "Error during rollback: $($_.Exception.Message)"
+        exit 1
+    }
+    Write-Fail $_.Exception.Message
+    if ($_.ScriptStackTrace) { Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray }
+    Write-Warn "Failure detected -- rolling back changes staged by this run."
+    Invoke-Rollback -State ([pscustomobject]$script:RollbackState)
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# 1. Environment validation
+# ---------------------------------------------------------------------------
+
+Write-Step "Validating environment"
 Write-OK "Running as Administrator"
 
 # Must be Windows Server
 $osInfo = Get-CimInstance Win32_OperatingSystem
 if ($osInfo.ProductType -eq 1) {
-    Write-Fail "This script targets Windows Server (ProductType 2 or 3). Detected a workstation OS. Aborting."
-    exit 1
+    throw "This script targets Windows Server (ProductType 2 or 3). Detected a workstation OS. Aborting."
 }
 Write-OK "OS: $($osInfo.Caption) (ProductType $($osInfo.ProductType))"
 
 # Sysprep must exist
 $sysprepExe = "$env:SystemRoot\System32\Sysprep\sysprep.exe"
 if (-not (Test-Path $sysprepExe)) {
-    Write-Fail "Sysprep not found at $sysprepExe"
-    exit 1
+    throw "Sysprep not found at $sysprepExe"
 }
 Write-OK "Sysprep found: $sysprepExe"
 
@@ -173,14 +332,12 @@ if (-not $AdminPassword) {
         break
     }
     if (-not $AdminPassword) {
-        Write-Fail "Could not confirm a password after $maxAttempts attempts."
-        exit 1
+        throw "Could not confirm a password after $maxAttempts attempts."
     }
 }
 
 if ([string]::IsNullOrWhiteSpace($AdminPassword)) {
-    Write-Fail "Password cannot be empty."
-    exit 1
+    throw "Password cannot be empty."
 }
 Write-OK "Password accepted (not echoed)"
 
@@ -194,6 +351,8 @@ $scriptsDir = "$env:SystemRoot\Setup\Scripts"
 
 if (-not (Test-Path $scriptsDir)) {
     New-Item -ItemType Directory -Path $scriptsDir -Force | Out-Null
+    $script:RollbackState.scriptsDirCreated = $true
+    Save-RollbackState
     Write-OK "Directory created: $scriptsDir"
 } else {
     Write-OK "Directory already exists: $scriptsDir"
@@ -217,6 +376,7 @@ if ((Test-Path $setupCompleteCmd) -and -not $Force) {
 powershell.exe -ExecutionPolicy RemoteSigned -WindowStyle Normal -File "%~dp0FirstBoot.ps1"
 '@
     Set-Content -Path $setupCompleteCmd -Value $cmdContent -Encoding ASCII -Force:$Force
+    Add-StagedFile -Path $setupCompleteCmd
     Write-OK "Written: $setupCompleteCmd"
 }
 
@@ -461,6 +621,7 @@ Unregister-ScheduledTask -TaskName 'FirstBootCleanup' -Confirm:`$false -ErrorAct
 '@
 
     Set-Content -Path $firstBootPs1 -Value $firstBootContent -Encoding UTF8
+    Add-StagedFile -Path $firstBootPs1
     Write-OK "Written: $firstBootPs1"
 }
 
@@ -474,6 +635,10 @@ $currentPolicy = Get-ExecutionPolicy -Scope LocalMachine
 if ($currentPolicy -in @('RemoteSigned', 'Unrestricted', 'Bypass')) {
     Write-OK "Already set to $currentPolicy -- no change needed"
 } else {
+    # Record the original policy first so a rollback can restore it.
+    $script:RollbackState.executionPolicyChanged  = $true
+    $script:RollbackState.originalExecutionPolicy = [string]$currentPolicy
+    Save-RollbackState
     Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
     Write-OK "ExecutionPolicy set to RemoteSigned"
 }
@@ -547,6 +712,7 @@ $unattendXml = @"
 "@
 
 Set-Content -Path $unattendPath -Value $unattendXml -Encoding UTF8
+Add-StagedFile -Path $unattendPath
 Write-OK "Written: $unattendPath"
 
 # Scrub the in-memory password now that it's on disk
@@ -574,6 +740,7 @@ if ($SkipSysprep) {
     Write-Warn "-SkipSysprep specified. Sysprep will NOT run."
     Write-Host "  Inspect the files above, then run Sysprep manually:" -ForegroundColor Yellow
     Write-Host "  $sysprepExe /generalize /oobe /shutdown /unattend:`"$unattendPath`"" -ForegroundColor Yellow
+    Write-Host "  Or undo the staging with: .\$($MyInvocation.MyCommand.Name) -Rollback" -ForegroundColor Yellow
     exit 0
 }
 
@@ -591,6 +758,7 @@ Write-Host ""
 $confirm = Read-Host "Type YES to proceed with Sysprep, anything else to abort"
 if ($confirm -ne 'YES') {
     Write-Warn "Aborted by user. Files remain staged. Re-run or invoke Sysprep manually."
+    Write-Warn "To undo the staging instead, run: .\$($MyInvocation.MyCommand.Name) -Rollback"
     exit 0
 }
 
@@ -619,7 +787,6 @@ $proc = Start-Process -FilePath $sysprepExe `
 $genState = (Get-ItemProperty 'HKLM:\SYSTEM\Setup\Status\SysprepStatus' -ErrorAction SilentlyContinue).GeneralizationState
 
 if ($genState -ne 7) {
-    Write-Fail "Sysprep did not complete generalize (GeneralizationState=$genState, exit code $($proc.ExitCode))."
     $errLog = "$env:SystemRoot\System32\Sysprep\Panther\setuperr.log"
     if (Test-Path $errLog) {
         Write-Host "`n  Last 20 lines of $errLog :" -ForegroundColor Yellow
@@ -627,12 +794,18 @@ if ($genState -ne 7) {
     } else {
         Write-Host "  Check C:\Windows\System32\Sysprep\Panther\setupact.log for details." -ForegroundColor Yellow
     }
-    exit 1
+    # Throwing routes through the failure trap, which rolls back the staging.
+    throw "Sysprep did not complete generalize (GeneralizationState=$genState, exit code $($proc.ExitCode))."
 }
 
-# Generalize succeeded -- /shutdown should be powering the VM off right now.
-# If we are still alive after a grace period, force the shutdown ourselves
-# so the golden image is never left running in a sealed state.
+# Generalize succeeded -- past the point of no return, so the staged files
+# must stay. Drop the rollback state so a later -Rollback cannot unseal the
+# image by deleting them.
+Remove-Item -Path $script:StateFile -Force -ErrorAction SilentlyContinue
+
+# /shutdown should be powering the VM off right now. If we are still alive
+# after a grace period, force the shutdown ourselves so the golden image is
+# never left running in a sealed state.
 Write-OK "Sysprep generalize completed. VM is shutting down."
 Start-Sleep -Seconds 90
 Write-Warn "Machine still running 90s after Sysprep finished -- forcing shutdown."
