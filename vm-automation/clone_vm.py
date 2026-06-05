@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-deploy_vm.py — Generate a VMX, clone a base VM's disk, and register it on ESXi.
+clone_vm.py — Clone a base VM's disk and register it on ESXi.
 
 The .vmdk / .nvram copies happen entirely on the ESXi server (no download/re-upload).
 The VMX is rendered in memory and uploaded. An optional config ISO can be uploaded
 to the VM's folder before registration.
 
 Examples:
-  ./deploy_vm.py -n dc01 -s esxi7.example.com -u root
-  ./deploy_vm.py -n dc01 -s esxi7.example.com -u root \\
+  ./clone_vm.py -n dc01 -s esxi7.example.com -u root
+  ./clone_vm.py -n dc01 -s esxi7.example.com -u root \\
       --datastore datastore1 --base ws-2025-base --iso isos/dc01-config.iso --power-on
 """
 
@@ -45,16 +45,16 @@ from vmlib.datastore import (
     upload_file,
 )
 
-log = logging.getLogger("deploy-vm")
+log = logging.getLogger("clone-vm")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="deploy_vm.py",
+        prog="clone_vm.py",
         description=(
-            "Render a VMX in memory, clone a base VM's disk server-side, and register "
-            "it on a standalone ESXi host. Optionally upload a config ISO before "
-            "registration and power on the VM when done."
+            "Clone a base VM's disk server-side, render a VMX, and register it on "
+            "a standalone ESXi host. Optionally upload a config ISO before registration "
+            "and power on the VM when done."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -199,7 +199,7 @@ def main() -> None:
 
     log.info("=" * 60)
     log.info(
-        "Deploy VM: %s  (base: %s, datastore: %s)",
+        "Clone VM: %s  (base: %s, datastore: %s)",
         args.name,
         args.base,
         args.datastore,
@@ -314,7 +314,7 @@ def main() -> None:
         register_vm(content, dc, args.datastore, args.name)
 
     except Exception as exc:
-        log.error("Deployment failed: %s", exc)
+        log.error("Clone failed: %s", exc)
         log.debug("Traceback:", exc_info=True)
         sys.exit(4)
     finally:

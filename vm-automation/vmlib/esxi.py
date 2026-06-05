@@ -93,21 +93,39 @@ def register_vm(
     wait_for_task(task, "Register VM")
 
 
-def power_on_vm(content: vim.ServiceInstanceContent, name: str) -> None:
-    """Power on the named VM."""
+def get_vm_by_name(
+    content: vim.ServiceInstanceContent, name: str
+) -> vim.VirtualMachine | None:
+    """Return the VM object matching ``name``, or None if not found."""
     view_mgr = content.viewManager
     assert view_mgr is not None
     view = view_mgr.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
     try:
-        target = next((vm for vm in view.view if vm.name == name), None)
+        return next((vm for vm in view.view if vm.name == name), None)
     finally:
         view.Destroy()
+
+
+def power_on_vm(content: vim.ServiceInstanceContent, name: str) -> None:
+    """Power on the named VM."""
+    target = get_vm_by_name(content, name)
     if not target:
         log.warning("Could not find VM '%s' to power on.", name)
         return
     log.info("Powering on VM: %s", name)
     task = target.PowerOnVM_Task()
     wait_for_task(task, "Power on")
+
+
+def power_off_vm(content: vim.ServiceInstanceContent, name: str) -> None:
+    """Power off the named VM."""
+    target = get_vm_by_name(content, name)
+    if not target:
+        log.warning("Could not find VM '%s' to power off.", name)
+        return
+    log.info("Powering off VM: %s", name)
+    task = target.PowerOffVM_Task()
+    wait_for_task(task, "Power off")
 
 
 def wait_for_task(task: vim.Task, label: str) -> object:
