@@ -16,9 +16,8 @@
       4. Sets the machine-wide ExecutionPolicy to RemoteSigned so
          SetupComplete.cmd can invoke the .ps1 without a bypass flag.
       5. Optionally accepts an -AdminPassword to embed in the unattend.xml
-         used by Sysprep's OOBE pass (auto-logon for the console session that
-         shows the first-boot prompts). If omitted, prompts twice and
-         requires both entries to match.
+         used by Sysprep's OOBE pass (one-time auto-logon on the deployed
+         VM). If omitted, prompts twice and requires both entries to match.
       6. Writes a minimal unattend.xml to C:\Windows\System32\Sysprep\unattend.xml.
       7. Runs Sysprep /generalize /oobe /shutdown /unattend and verifies the
          generalize actually succeeded before declaring victory.
@@ -32,7 +31,9 @@
       - Deploy new VMs from that image with deploy_vm.py + a config ISO built
         by gen_ws_config_iso.py.
       - On first boot the VM reads [cdrom]\vmconfig.json, configures hostname
-        and static IP, self-cleans, and reboots into a ready state.
+        and static IP, self-cleans, and reboots into a ready state. First-boot
+        progress is logged to C:\Windows\Temp\firstboot.log on the deployed VM
+        (nothing is shown on screen; it runs before any logon session).
 
 .PARAMETER AdminPassword
     Plain-text password to set for the built-in Administrator account via the
@@ -371,9 +372,10 @@ if ((Test-Path $setupCompleteCmd) -and -not $Force) {
 } else {
     $cmdContent = @'
 @echo off
-:: Launched automatically by Windows after OOBE completes, as SYSTEM.
-:: Hands off to the PowerShell first-boot script in a visible window.
-powershell.exe -ExecutionPolicy RemoteSigned -WindowStyle Normal -File "%~dp0FirstBoot.ps1"
+:: Launched automatically by Windows after OOBE completes, as SYSTEM, before
+:: any logon session exists -- there is no console anyone could see.
+:: FirstBoot.ps1 logs to C:\Windows\Temp\firstboot.log instead.
+powershell.exe -ExecutionPolicy RemoteSigned -WindowStyle Hidden -File "%~dp0FirstBoot.ps1"
 '@
     Set-Content -Path $setupCompleteCmd -Value $cmdContent -Encoding ASCII -Force:$Force
     Add-StagedFile -Path $setupCompleteCmd
@@ -399,9 +401,14 @@ $firstBootContent = @'
     Sysprep OOBE completes on a deployed golden-image VM.
 
 .DESCRIPTION
+    Runs non-interactively as SYSTEM before any logon session exists, so
+    nothing it could print would ever be seen. It therefore produces no
+    console output; progress and errors are appended to
+    C:\Windows\Temp\firstboot.log (fatal errors additionally to
+    C:\Windows\Temp\firstboot-error.log).
+
     Reads vmconfig.json from a mounted config ISO (any CD-ROM drive).
     Applies hostname, static IP, subnet prefix, gateway, and DNS.
-    Writes a transcript to C:\Windows\Temp\firstboot.log.
     Removes itself and SetupComplete.cmd after successful configuration.
     Reboots the machine.
 
@@ -420,14 +427,15 @@ $firstBootContent = @'
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$LogPath = "$env:SystemRoot\Temp\firstboot.log"
+$LogPath      = "$env:SystemRoot\Temp\firstboot.log"
 $ErrorLogPath = "$env:SystemRoot\Temp\firstboot-error.log"
 
-Start-Transcript -Path $LogPath -Append -Force
+function Write-Log {
+    param([string]$Message)
+    Add-Content -Path $LogPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $Message"
+}
 
-function Write-Step  { param([string]$m) Write-Host "`n==> $m" -ForegroundColor Cyan }
-function Write-OK    { param([string]$m) Write-Host "    [OK] $m" -ForegroundColor Green }
-function Write-Fail  { param([string]$m) Write-Host "    [FAIL] $m" -ForegroundColor Red }
+Write-Log "===== FirstBoot starting (as $env:USERNAME on $env:COMPUTERNAME) ====="
 
 try {
 
@@ -435,18 +443,13 @@ try {
     # 1. Locate config ISO
     # -----------------------------------------------------------------------
 
-    Write-Step "Locating config ISO"
-
-    $configDrive = $null
-    $configFile  = $null
-
-    $cdDrives = Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DriveType -eq 5 }
+    $configFile = $null
+    $cdDrives   = Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DriveType -eq 5 }
 
     foreach ($drive in $cdDrives) {
         $candidate = Join-Path $drive.DeviceID "vmconfig.json"
         if (Test-Path $candidate) {
-            $configDrive = $drive.DeviceID
-            $configFile  = $candidate
+            $configFile = $candidate
             break
         }
     }
@@ -455,14 +458,11 @@ try {
         throw "No config ISO found. Checked drives: $(($cdDrives | ForEach-Object { $_.DeviceID }) -join ', '). Ensure vmconfig.json is at the root of a mounted ISO."
     }
 
-    Write-OK "Config ISO found on $configDrive"
-    Write-OK "Config file: $configFile"
+    Write-Log "Config file: $configFile"
 
     # -----------------------------------------------------------------------
     # 2. Parse and validate vmconfig.json
     # -----------------------------------------------------------------------
-
-    Write-Step "Parsing vmconfig.json"
 
     $raw = Get-Content -Path $configFile -Raw -Encoding UTF8
     $cfg = $raw | ConvertFrom-Json
@@ -497,35 +497,52 @@ try {
         throw "Prefix '$prefix' is out of range (1-32)."
     }
     if ($hostname.Length -gt 15) {
-        Write-Host "    [WARN] Hostname '$hostname' exceeds 15 chars -- NetBIOS name will be truncated." -ForegroundColor Yellow
+        Write-Log "WARN: Hostname '$hostname' exceeds 15 chars -- NetBIOS name will be truncated."
     }
 
-    Write-OK "hostname   = $hostname"
-    Write-OK "ip         = $ip / $prefix"
-    Write-OK "gateway    = $gateway"
-    Write-OK "dns1       = $dns1"
-    if ($dns2)      { Write-OK "dns2       = $dns2" }
-    if ($dnsSuffix) { Write-OK "dns_suffix = $dnsSuffix" }
+    Write-Log "Config: hostname=$hostname ip=$ip/$prefix gateway=$gateway dns1=$dns1 dns2=$dns2 dns_suffix=$dnsSuffix"
 
     # -----------------------------------------------------------------------
     # 3. Apply hostname
     # -----------------------------------------------------------------------
 
-    Write-Step "Setting hostname"
+    # NetBIOS computer name: max 15 chars, stored upper-case.
+    $netbiosName = $hostname
+    if ($netbiosName.Length -gt 15) { $netbiosName = $netbiosName.Substring(0, 15) }
+    $netbiosName = $netbiosName.ToUpper()
 
-    $currentName = $env:COMPUTERNAME
-    if ($currentName -eq $hostname) {
-        Write-OK "Hostname is already '$hostname' -- skipping rename."
+    if ($env:COMPUTERNAME -eq $netbiosName) {
+        Write-Log "Hostname is already '$hostname' -- skipping rename."
     } else {
-        Rename-Computer -NewName $hostname -Force
-        Write-OK "Hostname changed from '$currentName' to '$hostname'"
+        # Rename-Computer is unreliable in this context: running as SYSTEM
+        # from SetupComplete.cmd (no logon session) it can report success
+        # without persisting the pending name. Try it, then VERIFY the
+        # pending name landed in the registry; if it did not, write the
+        # name directly to the keys Windows reads at boot.
+        try {
+            Rename-Computer -NewName $hostname -Force -ErrorAction Stop
+            Write-Log "Rename-Computer invoked for '$hostname'."
+        } catch {
+            Write-Log "WARN: Rename-Computer failed: $($_.Exception.Message). Falling back to registry."
+        }
+
+        $pendingKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName'
+        $tcpipKey   = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+
+        $pendingName = (Get-ItemProperty -Path $pendingKey).ComputerName
+        if ($pendingName -ne $netbiosName) {
+            Set-ItemProperty -Path $pendingKey -Name 'ComputerName' -Value $netbiosName
+            Set-ItemProperty -Path $tcpipKey   -Name 'Hostname'     -Value $hostname
+            Set-ItemProperty -Path $tcpipKey   -Name 'NV Hostname'  -Value $hostname
+            Write-Log "Hostname staged via registry ('$pendingName' -> '$netbiosName'); reboot applies it."
+        } else {
+            Write-Log "Hostname staged via Rename-Computer ('$pendingName'); reboot applies it."
+        }
     }
 
     # -----------------------------------------------------------------------
     # 4. Configure network
     # -----------------------------------------------------------------------
-
-    Write-Step "Configuring network adapter"
 
     # Find the first connected physical adapter -- skip loopback/tunnels
     $nic = Get-NetAdapter |
@@ -537,7 +554,7 @@ try {
         throw "No active network adapter found. Cannot configure static IP."
     }
 
-    Write-OK "Using adapter: $($nic.Name) ($($nic.InterfaceDescription))"
+    Write-Log "Using adapter: $($nic.Name) ($($nic.InterfaceDescription))"
 
     # Remove existing IP configuration on this adapter
     Remove-NetIPAddress -InterfaceIndex $nic.ifIndex -Confirm:$false -ErrorAction SilentlyContinue
@@ -550,25 +567,23 @@ try {
         -PrefixLength    $prefix `
         -DefaultGateway  $gateway | Out-Null
 
-    Write-OK "IP address set: $ip/$prefix via $gateway"
+    Write-Log "IP address set: $ip/$prefix via $gateway"
 
     # Set DNS servers
     $dnsServers = @($dns1)
     if ($dns2) { $dnsServers += $dns2 }
     Set-DnsClientServerAddress -InterfaceIndex $nic.ifIndex -ServerAddresses $dnsServers
-    Write-OK "DNS servers set: $($dnsServers -join ', ')"
+    Write-Log "DNS servers set: $($dnsServers -join ', ')"
 
     # Set DNS search suffix if provided
     if ($dnsSuffix) {
         Set-DnsClient -InterfaceIndex $nic.ifIndex -ConnectionSpecificSuffix $dnsSuffix
-        Write-OK "DNS suffix set: $dnsSuffix"
+        Write-Log "DNS suffix set: $dnsSuffix"
     }
 
     # -----------------------------------------------------------------------
     # 5. Self-cleanup
     # -----------------------------------------------------------------------
-
-    Write-Step "Cleaning up first-boot scripts"
 
     $selfDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -589,33 +604,26 @@ Unregister-ScheduledTask -TaskName 'FirstBootCleanup' -Confirm:`$false -ErrorAct
         -Action $action -Trigger $trigger -Settings $settings `
         -RunLevel Highest -Force | Out-Null
 
-    Write-OK "Cleanup task registered (runs at next logon, then removes itself)"
+    Write-Log "Cleanup task registered (runs at next logon, then removes itself)."
 
     # -----------------------------------------------------------------------
     # 6. Reboot
     # -----------------------------------------------------------------------
 
-    Write-Step "Configuration complete -- rebooting in 10 seconds"
-    Write-OK "Transcript saved to: $LogPath"
-
-    Stop-Transcript
-    Start-Sleep -Seconds 10
+    Write-Log "Configuration complete -- rebooting."
     Restart-Computer -Force
 
 } catch {
 
     $errMsg = $_.Exception.Message
-    Write-Fail "First-boot configuration failed: $errMsg"
+    Write-Log "ERROR: First-boot configuration failed: $errMsg"
 
-    # Write error log so it survives the session
+    # Separate error log so a failure is easy to spot
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     "$timestamp  ERROR: $errMsg`n$($_.ScriptStackTrace)" |
         Set-Content -Path $ErrorLogPath -Encoding UTF8 -Force
 
-    Write-Host "`nError details written to: $ErrorLogPath" -ForegroundColor Red
-    Write-Host "The machine has NOT been rebooted. Fix the issue and re-run, or inspect the log." -ForegroundColor Yellow
-
-    Stop-Transcript
+    Write-Log "Error details written to: $ErrorLogPath. Machine NOT rebooted."
     exit 1
 }
 '@
@@ -666,7 +674,8 @@ $unattendXml = @"
   <!--
     oobeSystem pass: runs after Sysprep OOBE on first boot of deployed VM.
     Skips all interactive screens.
-    Auto-logs on once so SetupComplete.cmd fires in a visible console session.
+    First-boot configuration runs via SetupComplete.cmd as SYSTEM and logs
+    to C:\Windows\Temp\firstboot.log.
   -->
   <settings pass="oobeSystem">
     <component name="Microsoft-Windows-Shell-Setup"
@@ -694,7 +703,7 @@ $unattendXml = @"
         </AdministratorPassword>
       </UserAccounts>
 
-      <!-- Auto-logon fires SetupComplete.cmd which launches FirstBoot.ps1 -->
+      <!-- One-time auto-logon; the FirstBootCleanup scheduled task fires at this logon -->
       <AutoLogon>
         <Password>
           <Value>$escapedPassword</Value>
