@@ -3,34 +3,43 @@
 Automation for deploying ESXi VMs from a golden image: prepare a base image, generate per-VM
 first-boot config, pack it into an ISO, clone the VM, and let it self-configure on first boot.
 
-This repository is the **superproject** — an assembly of three reusable libraries (git
-submodules) plus the thin CLIs that drive them. The libraries hold all the logic so the same
-core can back the CLIs today and a REST API / GUI later.
+This repository is the **scripts** deliverable — thin CLIs over three reusable libraries that
+hold all the logic, so the same core backs these CLIs today and a REST API / GUI later. The
+libraries are consumed as **versioned git dependencies** (not vendored), so this repo clones and
+runs on its own.
 
 ## Layout
 
 ```
 VM-Setup-Scripts/
-├── vmkit/         submodule → ESXi/vCenter automation (connect, clone, datastore, VMX)
-├── configgen/     submodule → generate per-VM hostname/network first-boot scripts
-├── isokit/        submodule → pack first-boot scripts into a config ISO
 ├── cli/           thin command-line front-ends over the three libraries
 └── base-vm-setup/ one-time golden-image prep (Linux firstboot runner, Windows sysprep)
 ```
 
-The libraries are independent repos under `Arnesh-EC/{vmkit,configgen,isokit}`. Library code
-takes parameters and raises exceptions; it never prompts, prints, or calls `sys.exit` — those
-belong to the CLI (and future API) layer.
+The libraries are independent public repos, pinned in `pyproject.toml` (`[tool.uv.sources]`):
+- `vmkit` — ESXi/vCenter automation (connect, clone, datastore, VMX)
+- `configgen` — generate per-VM hostname/network first-boot scripts
+- `isokit` — pack first-boot scripts into a config ISO
+
+Library code takes parameters and raises exceptions; it never prompts, prints, or calls
+`sys.exit` — those belong to the CLI (and future API) layer.
 
 ## Setup
 
 ```sh
-git clone --recurse-submodules git@github-ec:Arnesh-EC/VM-Setup-Scripts.git
+git clone git@github-ec:Arnesh-EC/VM-Setup-Scripts.git
 cd VM-Setup-Scripts
-uv sync          # installs the three libraries (editable) + their deps
+uv sync          # installs the CLIs + the three libraries (from their git tags) + deps
 ```
 
-(Already cloned without `--recurse-submodules`? Run `git submodule update --init`.)
+### Develop a library locally
+The libraries install from pinned git tags, so this repo isn't an editable workspace over them.
+To hack on a library and see changes here, clone it and install it editable into this venv:
+
+```sh
+git clone git@github-ec:Arnesh-EC/vmkit.git ../vmkit
+uv pip install -e ../vmkit       # overrides the git-pinned vmkit until the next `uv sync`
+```
 
 ## End-to-end workflow
 
@@ -43,8 +52,8 @@ uv sync          # installs the three libraries (editable) + their deps
 
 2. **Generate per-VM config scripts:**
    ```sh
-   gen-hostname -n web01 -o 10-hostname.sh
-   gen-network --ip 192.168.1.50 --prefix 24 --gateway 192.168.1.1 --dns1 192.168.1.10 -o 20-network.sh
+   gen-hostname --platform linux -n web01 -o 10-hostname.sh
+   gen-network --platform linux --ip 192.168.1.50 --prefix 24 --gateway 192.168.1.1 --dns1 192.168.1.10 -o 20-network.sh
    ```
 
 3. **Pack them into a config ISO:**

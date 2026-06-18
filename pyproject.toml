@@ -17,9 +17,9 @@ gen-hostname = "cli.gen_hostname:main"
 gen-network = "cli.gen_network:main"
 
 [tool.uv.sources]
-vmkit = { path = "vmkit", editable = true }
-configgen = { path = "configgen", editable = true }
-isokit = { path = "isokit", editable = true }
+vmkit = { git = "https://github.com/Arnesh-EC/vmkit.git", tag = "v0.1.0" }
+configgen = { git = "https://github.com/Arnesh-EC/configgen.git", tag = "v0.1.0" }
+isokit = { git = "https://github.com/Arnesh-EC/isokit.git", tag = "v0.1.0" }
 
 [build-system]
 requires = ["hatchling"]

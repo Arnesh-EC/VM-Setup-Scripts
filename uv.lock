@@ -64,7 +64,7 @@ wheels = [
 [[package]]
 name = "configgen"
 version = "0.1.0"
-source = { editable = "configgen" }
+source = { git = "https://github.com/Arnesh-EC/configgen.git?tag=v0.1.0#38ddda04f5538ece5d1122e9735d3449b710d8a6" }
 
 [[package]]
 name = "idna"
@@ -78,13 +78,10 @@ wheels = [
 [[package]]
 name = "isokit"
 version = "0.1.0"
-source = { editable = "isokit" }
+source = { git = "https://github.com/Arnesh-EC/isokit.git?tag=v0.1.0#e3ab515b04381cc8858ddf498993bf47258850c1" }
 dependencies = [
     { name = "pycdlib" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "pycdlib", specifier = ">=1.16.0" }]
 
 [[package]]
 name = "pycdlib"
@@ -151,24 +148,17 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "configgen", editable = "configgen" },
-    { name = "isokit", editable = "isokit" },
-    { name = "vmkit", editable = "vmkit" },
+    { name = "configgen", git = "https://github.com/Arnesh-EC/configgen.git?tag=v0.1.0" },
+    { name = "isokit", git = "https://github.com/Arnesh-EC/isokit.git?tag=v0.1.0" },
+    { name = "vmkit", git = "https://github.com/Arnesh-EC/vmkit.git?tag=v0.1.0" },
 ]
 
 [[package]]
 name = "vmkit"
 version = "0.1.0"
-source = { editable = "vmkit" }
+source = { git = "https://github.com/Arnesh-EC/vmkit.git?tag=v0.1.0#1cc610e28d40972f710d88855b98d87eaf988528" }
 dependencies = [
     { name = "pyvmomi" },
     { name = "requests" },
     { name = "tqdm" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "pyvmomi", specifier = ">=9.1.0.0" },
-    { name = "requests", specifier = ">=2.34.2" },
-    { name = "tqdm", specifier = ">=4.67.3" },
 ]
