@@ -1,57 +1,29 @@
 #!/usr/bin/env python3
-"""
-clone_vm.py — Clone a base VM's disk and register it on ESXi.
+"""clone-vm — Clone a base VM's disk and register it on ESXi.
 
-The .vmdk / .nvram copies happen entirely on the ESXi server (no download/re-upload).
-The VMX is rendered in memory and uploaded. An optional config ISO can be uploaded
-to the VM's folder before registration.
-
-Examples:
-  ./clone_vm.py -n dc01 -s esxi7.example.com -u root
-  ./clone_vm.py -n dc01 -s esxi7.example.com -u root \\
-      --datastore datastore1 --base ws-2025-base --iso isos/dc01-config.iso --power-on
+Thin CLI over ``vmkit.clone_workflow``: parse args, prompt for the password,
+open a connection, run the workflow, and map vmkit errors to exit codes. The
+.vmdk/.nvram copies happen server-side; the VMX is rendered and uploaded.
 """
 
 import argparse
-import getpass
 import logging
-import os
 import sys
-import tempfile
-import time
 
-from vmkit.validate import (
-    validate_cpus,
-    validate_hostname_rfc,
-    validate_iso_path,
-    validate_mac,
-    validate_memory,
-)
-from vmkit.progress import human_bytes, setup_logging
-from vmkit.vmx import DEFAULT_GUEST_OS, parse_guest_os, random_mac, render_vmx
-from vmkit.esxi import (
-    connect,
-    get_datacenter,
-    get_datastore,
-    list_vm_names,
-    power_on_vm,
-    register_vm,
-)
-from vmkit.datastore import (
-    copy_datastore_file,
-    copy_virtual_disk,
-    get_base_vmdk_size,
-    make_directory,
-    read_datastore_file,
-    upload_file,
-)
+import configgen
+import vmkit
+from vmkit.progress import setup_logging
+from vmkit.vmx import DEFAULT_GUEST_OS
+from vmkit.validate import validate_cpus, validate_iso_path, validate_mac, validate_memory
 
-log = logging.getLogger("clone-vm")
+from cli._common import add_connection_args, arg_validator, resolve_password
+
+log = logging.getLogger("deploy-vm")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="clone_vm.py",
+        prog="clone-vm",
         description=(
             "Clone a base VM's disk server-side, render a VMX, and register it on "
             "a standalone ESXi host. Optionally upload a config ISO before registration "
@@ -65,317 +37,109 @@ def build_parser() -> argparse.ArgumentParser:
             "--base ws-2025-base --iso isos/dc01-config.iso --power-on"
         ),
     )
-
-    # Identity
     parser.add_argument(
-        "-n",
-        "--name",
-        required=True,
-        type=validate_hostname_rfc,
+        "-n", "--name", required=True,
+        type=arg_validator(configgen.validate_hostname_rfc),
         metavar="NAME",
         help="VM name / hostname (RFC 1123). Used as the folder and file base name.",
     )
-
-    # VMX generation
     parser.add_argument(
-        "-m",
-        "--mac-address",
-        default=None,
-        type=validate_mac,
+        "-m", "--mac-address", default=None, type=arg_validator(validate_mac),
         metavar="MAC",
-        help=(
-            "Static MAC for ethernet0 (XX:XX:XX:XX:XX:XX). "
-            "VMware static range: 00:50:56:00:00:00 – 00:50:56:3F:FF:FF. "
-            "Defaults to a random MAC in that range."
-        ),
+        help="Static MAC for ethernet0 (VMware static range). Defaults to a random MAC.",
     )
     parser.add_argument(
-        "-c",
-        "--cpus",
-        default=2,
-        type=validate_cpus,
-        metavar="N",
-        help="Number of vCPUs (power of 2, 1–128). Default: 2.",
+        "-c", "--cpus", default=2, type=arg_validator(validate_cpus),
+        metavar="N", help="Number of vCPUs (power of 2, 1–128). Default: 2.",
     )
     parser.add_argument(
-        "-r",
-        "--ram",
-        default=4096,
-        type=validate_memory,
-        metavar="MB",
-        help="RAM in MB (multiple of 4, min 512). Default: 4096 (4 GB).",
+        "-r", "--ram", default=4096, type=arg_validator(validate_memory),
+        metavar="MB", help="RAM in MB (multiple of 4, min 512). Default: 4096.",
     )
     parser.add_argument(
-        "--iso",
-        default=None,
-        type=validate_iso_path,
+        "--iso", default=None, type=arg_validator(validate_iso_path),
         metavar="FILE",
-        help=(
-            "Local .iso file to upload before VMX registration. "
-            "Stored as {name}-config.iso in the VM folder and attached as CD-ROM."
-        ),
+        help="Local .iso to upload as {name}-config.iso and attach as CD-ROM.",
     )
 
-    # Connection
-    parser.add_argument(
-        "-s",
-        "--server",
-        required=True,
-        metavar="HOST",
-        help="ESXi host FQDN or IP.",
-    )
-    parser.add_argument(
-        "-u",
-        "--user",
-        required=True,
-        metavar="USER",
-        help="ESXi username.",
-    )
-    parser.add_argument(
-        "-p",
-        "--password",
-        default=None,
-        metavar="PASS",
-        help="ESXi password. If omitted, prompts securely.",
-    )
-    parser.add_argument(
-        "-P",
-        "--port",
-        type=int,
-        default=443,
-        metavar="PORT",
-        help="HTTPS port (default: 443).",
-    )
+    add_connection_args(parser)
 
-    # Datastore / clone
     parser.add_argument(
-        "-d",
-        "--datastore",
-        default="datastore1",
-        metavar="DS",
+        "-d", "--datastore", default="datastore1", metavar="DS",
         help="Datastore name (default: datastore1).",
     )
     parser.add_argument(
-        "-b",
-        "--base",
-        default="ws-2025-base",
-        metavar="BASE",
+        "-b", "--base", default="ws-2025-base", metavar="BASE",
         help="Base VM folder/file name to clone (default: ws-2025-base).",
     )
     parser.add_argument(
-        "--guest-os",
-        default=None,
-        metavar="ID",
-        help=(
-            "VMware guestOS identifier to bake into the VMX (e.g. "
-            "other6xLinux64Guest). If omitted, it is read from the base VM's "
-            f"VMX; if that cannot be read, defaults to {DEFAULT_GUEST_OS}."
-        ),
+        "--guest-os", default=None, metavar="ID",
+        help=("VMware guestOS id to bake into the VMX. If omitted, read from the "
+              f"base VM's VMX; if unreadable, defaults to {DEFAULT_GUEST_OS}."),
     )
     parser.add_argument(
-        "--max-usage",
-        type=float,
-        default=80.0,
-        metavar="PCT",
-        help=(
-            "Abort if the datastore would exceed this %% full after cloning "
-            "the base VMDK (default: 80)."
-        ),
+        "--max-usage", type=float, default=80.0, metavar="PCT",
+        help="Abort if the datastore would exceed this %% full after cloning (default: 80).",
     )
     parser.add_argument(
-        "--skip-disk-check",
-        action="store_true",
+        "--skip-disk-check", action="store_true",
         help="Skip the datastore free-space pre-flight check entirely.",
     )
-
-    # Post-deploy
     parser.add_argument(
-        "-o",
-        "--power-on",
-        action="store_true",
+        "-o", "--power-on", action="store_true",
         help="Power on the VM after registration.",
     )
     parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Verbose (DEBUG) console output.",
+        "-v", "--verbose", action="store_true", help="Verbose (DEBUG) console output.",
     )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    logfile_path = setup_logging(args.name, args.verbose)
+    setup_logging(args.name, args.verbose)
 
     log.info("=" * 60)
-    log.info(
-        "Clone VM: %s  (base: %s, datastore: %s)",
-        args.name,
-        args.base,
-        args.datastore,
-    )
+    log.info("Clone VM: %s  (base: %s, datastore: %s)", args.name, args.base, args.datastore)
     log.info("=" * 60)
-    log.info("Logging to: %s", logfile_path)
 
-    if args.password:
-        password = args.password
-    else:
-        try:
-            password = getpass.getpass(
-                f"Password for {args.user}@{args.server}: ", echo_char="*"
-            )
-        except (KeyboardInterrupt, EOFError):
-            print()
-            log.error("Authentication cancelled.")
-            sys.exit(130)
+    password = resolve_password(args)
 
-    si = connect(args.server, args.user, password, args.port)
-    content = si.content
-    dc = get_datacenter(content)
-
-    # Pre-flight: refuse if name already exists
-    existing = list_vm_names(content)
-    if args.name in existing:
-        log.error("A VM named '%s' already exists. Aborting.", args.name)
-        sys.exit(3)
-
-    # Pre-flight: refuse if cloning the base VMDK would over-fill the datastore
-    if args.skip_disk_check:
-        log.warning(
-            "Skipping datastore free-space check (--skip-disk-check). "
-            "Hope you know what you're doing!"
-        )
-    else:
-        log.info("Checking disk usage constraints...")
-        ds = get_datastore(content, args.datastore)
-        capacity = ds.summary.capacity
-        free = ds.summary.freeSpace
-        used = capacity - free
-        vmdk_size = get_base_vmdk_size(ds, args.base)
-        used_after = used + vmdk_size
-        pct_now = (used / capacity * 100) if capacity else 0.0
-        pct_after = (used_after / capacity * 100) if capacity else 0.0
-
-        log.info("Datastore '%s' disk usage:", args.datastore)
-        log.info("  capacity      : %s", human_bytes(capacity))
-        log.info("  used (now)    : %s (%.1f%%)", human_bytes(used), pct_now)
-        log.info("  base VMDK     : %s", human_bytes(vmdk_size))
-        log.info("  used (after)  : %s (%.1f%%)", human_bytes(used_after), pct_after)
-
-        if pct_after > args.max_usage:
-            log.error(
-                "Limited disk resource: cloning the base VMDK would leave datastore "
-                "'%s' at %.1f%% full, exceeding the %.1f%% limit. Aborting.",
-                args.datastore,
-                pct_after,
-                args.max_usage,
-            )
-            sys.exit(6)
-
-    # Resolve MAC
-    mac = args.mac_address or random_mac()
-    mac_source = "specified" if args.mac_address else "randomly generated"
-    log.info("MAC address: %s (%s)", mac, mac_source)
-
-    # Resolve guest OS: explicit override, else read it from the base VM's VMX
-    # so a Linux base yields a Linux VMX (instead of hardcoding Windows).
-    if args.guest_os:
-        guest_os = args.guest_os
-        log.info("Guest OS: %s (specified)", guest_os)
-    else:
-        guest_os = DEFAULT_GUEST_OS
-        try:
-            base_vmx = read_datastore_file(
-                args.server, args.user, password, args.port,
-                args.datastore, dc.name, f"{args.base}/{args.base}.vmx",
-            )
-            detected = parse_guest_os(base_vmx)
-            if detected:
-                guest_os = detected
-                log.info("Guest OS: %s (detected from base '%s')", guest_os, args.base)
-            else:
-                log.warning(
-                    "No guestOS line in base VMX; defaulting to %s.", guest_os
-                )
-        except Exception as exc:
-            log.warning(
-                "Could not read base VMX (%s); defaulting guest OS to %s.",
-                exc, guest_os,
-            )
-
-    # Render VMX in memory
-    iso_filename = f"{args.name}-config.iso" if args.iso else None
-    vmx_content = render_vmx(
-        args.name, mac, args.cpus, args.ram,
-        iso_filename=iso_filename, guest_os=guest_os,
-    )
-    log.debug("VMX rendered (%d bytes)", len(vmx_content))
-
-    tmp_vmx = None
     try:
-        make_directory(content, dc, args.datastore, args.name)
-        copy_virtual_disk(content, dc, args.datastore, args.base, args.name)
-        copy_datastore_file(content, dc, args.datastore, args.base, args.name, "nvram")
-
-        if args.iso:
-            upload_file(
-                args.server,
-                args.user,
-                password,
-                args.port,
-                args.datastore,
-                dc.name,
-                args.name,
-                args.iso,
-                remote_filename=f"{args.name}-config.iso",
-            )
-
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".vmx", delete=False, encoding="utf-8"
-        ) as f:
-            f.write(vmx_content)
-            tmp_vmx = f.name
-
-        upload_file(
-            args.server,
-            args.user,
-            password,
-            args.port,
-            args.datastore,
-            dc.name,
-            args.name,
-            tmp_vmx,
-            remote_filename=f"{args.name}.vmx",
+        conn = vmkit.open_connection(args.server, args.user, password, args.port)
+        result = vmkit.clone_workflow(
+            conn,
+            name=args.name,
+            base=args.base,
+            datastore=args.datastore,
+            cpus=args.cpus,
+            mem_mb=args.ram,
+            mac=args.mac_address,
+            iso_path=args.iso,
+            guest_os=args.guest_os,
+            max_usage_pct=args.max_usage,
+            skip_disk_check=args.skip_disk_check,
+            power_on=args.power_on,
         )
-
-        register_vm(content, dc, args.datastore, args.name)
-
+    except (vmkit.AuthenticationError, vmkit.ConnectionFailedError) as exc:
+        log.error("%s", exc)
+        sys.exit(2)
+    except vmkit.VmExistsError as exc:
+        log.error("%s Aborting.", exc)
+        sys.exit(3)
+    except vmkit.InsufficientSpaceError as exc:
+        log.error("Limited disk resource: %s Aborting.", exc)
+        sys.exit(6)
+    except vmkit.VmkitError as exc:
+        log.error("Clone failed: %s", exc)
+        sys.exit(4)
     except Exception as exc:
         log.error("Clone failed: %s", exc)
         log.debug("Traceback:", exc_info=True)
         sys.exit(4)
-    finally:
-        if tmp_vmx is not None:
-            try:
-                os.unlink(tmp_vmx)
-            except OSError:
-                pass
 
-    # Confirm
-    log.info("Waiting for inventory to settle ...")
-    time.sleep(3)
-    names_after = list_vm_names(content)
-    if args.name in names_after:
-        log.info("CONFIRMED: VM '%s' is now in inventory.", args.name)
-    else:
-        log.error("VM '%s' NOT found in inventory after registration!", args.name)
-        sys.exit(5)
-
-    if args.power_on:
-        power_on_vm(content, args.name)
-
-    log.info("Done. Total VMs in inventory: %d", len(names_after))
+    log.info("Done. VM '%s' registered (total VMs in inventory: %d).",
+             result.name, result.total_vms)
 
 
 if __name__ == "__main__":
